@@ -20,6 +20,12 @@ const otpLimiter = rateLimit({
   message: { error: 'RATE_LIMITED', message: 'Too many OTP requests' }
 });
 
+const otpVerifyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,
+  message: { error: 'RATE_LIMITED', message: 'Too many verification attempts' }
+});
+
 // ──────────────────────────── Routes ────────────────────────────
 
 // POST /api/auth/register
@@ -47,7 +53,7 @@ router.post('/login', authLimiter, async (req, res) => {
 });
 
 // POST /api/auth/google
-router.post('/google', async (req, res) => {
+router.post('/google', authLimiter, async (req, res) => {
   try {
     const { idToken } = req.body;
     const result = await authService.googleSignIn(idToken);
@@ -66,19 +72,20 @@ router.post('/forgot-password', otpLimiter, async (req, res) => {
     // In dev, we return the OTP for testing.
     res.json({ success: true, otp: result.otp });
   } catch (e) {
-    const status = e.code === 'RATE_LIMITED' ? 429 : 400;
+    const status = e.code === 'RATE_LIMITED' ? 429
+      : e.code === 'EMAIL_DELIVERY_FAILED' ? 503 : 400;
     res.status(status).json({ error: e.code || 'OTP_FAILED', message: e.message });
   }
 });
 
 // POST /api/auth/verify-otp-and-reset
-router.post('/verify-otp-and-reset', async (req, res) => {
+router.post('/verify-otp-and-reset', otpVerifyLimiter, async (req, res) => {
   try {
     const { email, otp, newPassword } = req.body;
     await authService.verifyOtpAndResetPassword(email, otp, newPassword);
     res.json({ success: true });
   } catch (e) {
-    const status = e.code === 'OTP_INVALID' ? 400 : 400;
+    const status = e.code === 'RATE_LIMITED' ? 429 : 400;
     res.status(status).json({ error: e.code || 'RESET_FAILED', message: e.message });
   }
 });
