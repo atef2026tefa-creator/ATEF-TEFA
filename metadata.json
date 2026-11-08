@@ -1,0 +1,6 @@
+{
+  "name": "Cost App Pro",
+  "description": "Comprehensive personal and vehicle cost tracker with budgeting, income, certificates, and reports.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
