@@ -24,11 +24,10 @@ app.use(helmet());
 const allowedOrigins = (process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({
   origin(origin, callback) {
-    if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
-    }
+    // Native Android clients normally send no Origin header. Browser origins
+    // must be explicitly listed; an empty allowlist fails closed.
+    if (!origin) return callback(null, true);
+    return callback(null, allowedOrigins.includes(origin));
   }
 }));
 

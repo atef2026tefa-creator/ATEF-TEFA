@@ -13,7 +13,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 const { OAuth2Client } = require('google-auth-library');
-const { query } = require('../config/database');
+const { query, getClient } = require('../config/database');
 
 // ──────────────────────────── JWT ────────────────────────────
 
@@ -147,16 +147,20 @@ async function googleSignIn(idToken) {
 
   // Look up by google_id first, then by email (link accounts).
   let result = await query(
-    'SELECT id, email, display_name FROM users WHERE google_id = $1 OR email = $2',
+    'SELECT id, email, display_name, google_id FROM users WHERE google_id = $1 OR email = $2',
     [googleId, email]
   );
   if (result.rowCount === 0) {
-    // Create a new user with no password (Google-only).
+    // The current schema requires password_hash NOT NULL. Use an unknown,
+    // cryptographically random password for Google-only accounts; users can
+    // later set a password through the verified email reset flow.
+    const randomPassword = crypto.randomBytes(48).toString('hex');
+    const passwordHash = await bcrypt.hash(randomPassword, 12);
     result = await query(
-      `INSERT INTO users (email, google_id, display_name, email_verified)
-       VALUES ($1, $2, $3, TRUE)
-       RETURNING id, email, display_name`,
-      [email, googleId, displayName]
+      `INSERT INTO users (email, password_hash, google_id, display_name, email_verified)
+       VALUES ($1, $2, $3, $4, TRUE)
+       RETURNING id, email, display_name, google_id`,
+      [email, passwordHash, googleId, displayName]
     );
   } else {
     // Optionally link: if user exists by email but no google_id, set it.
@@ -202,11 +206,13 @@ async function forgotPassword(rawEmail) {
     [email]
   );
 
-  await query(
+  const otpResult = await query(
     `INSERT INTO password_reset_otps (email, otp_hash, expires_at)
-     VALUES ($1, $2, $3)`,
+     VALUES ($1, $2, $3)
+     RETURNING id`,
     [email, otpHash, expiresAt]
   );
+  const otpId = otpResult.rows[0].id;
 
   // Send the OTP email.
   try {
@@ -234,8 +240,16 @@ async function forgotPassword(rawEmail) {
     });
   } catch (e) {
     console.error('Failed to send OTP email:', e);
-    // Don't fail the request — the OTP is in the DB and the dev-mode
-    // app can read it via the debug endpoint if needed.
+    // Never report success when the email was not delivered. Invalidate the
+    // stored code so it cannot be used even if delivery status is ambiguous.
+    await query(
+      'UPDATE password_reset_otps SET consumed = TRUE WHERE id = $1',
+      [otpId]
+    );
+    throw Object.assign(
+      new Error('تعذر إرسال رمز التحقق حالياً. حاول مرة أخرى لاحقاً.'),
+      { code: 'EMAIL_DELIVERY_FAILED' }
+    );
   }
 
   // Stage 3.3.2 fix: only return the OTP in development mode (strict check).
@@ -258,48 +272,72 @@ async function verifyOtpAndResetPassword(rawEmail, otp, newPassword) {
   if (newPassword.length < 6) {
     throw Object.assign(new Error(genericAuthError('WEAK_PASSWORD')), { code: 'WEAK_PASSWORD' });
   }
-
-  const result = await query(
-    `SELECT id, otp_hash, expires_at, consumed, attempts
-     FROM password_reset_otps
-     WHERE email = $1 AND consumed = FALSE
-     ORDER BY created_at DESC
-     LIMIT 1`,
-    [email]
-  );
-  if (result.rowCount === 0) {
-    throw Object.assign(new Error('لم يُطلب رمز لهذا البريد'), { code: 'OTP_NOT_FOUND' });
-  }
-
-  const otpRow = result.rows[0];
-
-  if (new Date() > otpRow.expires_at) {
-    await query('UPDATE password_reset_otps SET consumed = TRUE WHERE id = $1', [otpRow.id]);
-    throw Object.assign(new Error('انتهت صلاحية الرمز'), { code: 'OTP_EXPIRED' });
-  }
-
-  if (otpRow.attempts >= MAX_OTP_ATTEMPTS) {
-    await query('UPDATE password_reset_otps SET consumed = TRUE WHERE id = $1', [otpRow.id]);
-    throw Object.assign(new Error('محاولات كثيرة خاطئة'), { code: 'OTP_USED' });
-  }
-
-  const valid = await bcrypt.compare(otp, otpRow.otp_hash);
-  if (!valid) {
-    await query('UPDATE password_reset_otps SET attempts = attempts + 1 WHERE id = $1', [otpRow.id]);
+  if (!/^\d{6}$/.test(String(otp))) {
     throw Object.assign(new Error('الرمز غير صحيح'), { code: 'OTP_INVALID' });
   }
 
-  await query('UPDATE password_reset_otps SET consumed = TRUE WHERE id = $1', [otpRow.id]);
+  const client = await getClient();
+  let deferredError = null;
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      `SELECT id, otp_hash, expires_at, consumed, attempts
+       FROM password_reset_otps
+       WHERE email = $1 AND consumed = FALSE
+       ORDER BY created_at DESC
+       LIMIT 1
+       FOR UPDATE`,
+      [email]
+    );
 
-  const passwordHash = await bcrypt.hash(newPassword, 12);
-  const userResult = await query(
-    'UPDATE users SET password_hash = $1 WHERE email = $2 RETURNING id',
-    [passwordHash, email]
-  );
-  if (userResult.rowCount === 0) {
-    throw Object.assign(new Error('المستخدم غير موجود'), { code: 'USER_NOT_FOUND' });
+    if (result.rowCount === 0) {
+      throw Object.assign(new Error('لم يُطلب رمز لهذا البريد'), { code: 'OTP_NOT_FOUND' });
+    }
+
+    const otpRow = result.rows[0];
+    if (new Date(otpRow.expires_at).getTime() <= Date.now()) {
+      await client.query('UPDATE password_reset_otps SET consumed = TRUE WHERE id = $1', [otpRow.id]);
+      await client.query('COMMIT');
+      deferredError = Object.assign(new Error('انتهت صلاحية الرمز'), { code: 'OTP_EXPIRED' });
+    } else if (otpRow.attempts >= MAX_OTP_ATTEMPTS) {
+      await client.query('UPDATE password_reset_otps SET consumed = TRUE WHERE id = $1', [otpRow.id]);
+      await client.query('COMMIT');
+      deferredError = Object.assign(new Error('محاولات كثيرة خاطئة'), { code: 'OTP_USED' });
+    } else {
+      const valid = await bcrypt.compare(String(otp), otpRow.otp_hash);
+      if (!valid) {
+        await client.query(
+          'UPDATE password_reset_otps SET attempts = attempts + 1 WHERE id = $1',
+          [otpRow.id]
+        );
+        await client.query('COMMIT');
+        deferredError = Object.assign(new Error('الرمز غير صحيح'), { code: 'OTP_INVALID' });
+      } else {
+        const passwordHash = await bcrypt.hash(newPassword, 12);
+        const userResult = await client.query(
+          'UPDATE users SET password_hash = $1 WHERE email = $2 RETURNING id',
+          [passwordHash, email]
+        );
+        if (userResult.rowCount === 0) {
+          throw Object.assign(new Error('المستخدم غير موجود'), { code: 'USER_NOT_FOUND' });
+        }
+        await client.query(
+          'UPDATE password_reset_otps SET consumed = TRUE WHERE id = $1',
+          [otpRow.id]
+        );
+        await client.query('COMMIT');
+      }
+    }
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch (rollbackError) {
+      console.error('OTP reset rollback failed:', rollbackError);
+    }
+    throw error;
+  } finally {
+    client.release();
   }
 
+  if (deferredError) throw deferredError;
   return { success: true };
 }
 
