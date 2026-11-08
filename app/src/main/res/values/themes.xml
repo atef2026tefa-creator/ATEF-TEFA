@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Material 3 themes for Android 24+ (Compose handles the rest in code) -->
-    <style name="Theme.CostAppPro" parent="android:Theme.Material.Light.NoActionBar">
+    <!-- AppCompatActivity requires an AppCompat theme; Compose handles the UI styling. -->
+    <style name="Theme.CostAppPro" parent="Theme.AppCompat.Light.NoActionBar">
         <item name="android:statusBarColor">@color/brand_background_dark</item>
         <item name="android:windowBackground">@color/brand_background_dark</item>
         <item name="android:windowLightStatusBar">false</item>
