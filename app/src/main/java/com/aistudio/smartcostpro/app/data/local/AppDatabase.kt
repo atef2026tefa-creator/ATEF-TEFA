@@ -85,6 +85,7 @@ abstract class AppDatabase : RoomDatabase() {
             klass = AppDatabase::class.java,
             name = Constants.DATABASE_NAME
         )
+            .fallbackToDestructiveMigration()
             .fallbackToDestructiveMigrationOnDowngrade()
             .build()
     }
